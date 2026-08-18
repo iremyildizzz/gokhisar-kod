@@ -1,0 +1,21 @@
+# Core Vision & AI Deep Learning
+ultralytics>=8.2.0
+
+# Multi-Object Tracking & Evaluation
+supervision>=0.20.0
+
+# Image Processing & Computer Vision
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# User Interface (Qt Framework)
+PySide6>=6.5.0
+
+# Hardware Integration & Communication
+pyserial>=3.5
+
+# Testing & Quality Assurance
+pytest>=7.4.0
+
+# KTR uygunluk PDF üretimi (tools/generate_ktr_pdf.py)
+reportlab>=4.0.0

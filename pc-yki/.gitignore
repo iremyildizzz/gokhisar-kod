@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+
+# YOLO ağırlıkları (~67 MB) — Git LFS olmadan repoyu şişirir.
+# Dosyayı elle models/ altına koyun veya GOKHISAR_YOLO_WEIGHTS ile yol verin.
+models/*.pt
+models/*.onnx
+models/*.engine
+
+# Çalışma zamanı çıktıları
+logs/
+*.log
+.gokhisar.json
+.pytest_cache/
+
+# Üretilmiş analiz PDF'i (tools/generate_ktr_pdf.py ile yeniden üretilir)
+docs/KTR-uygunluk-analizi.pdf

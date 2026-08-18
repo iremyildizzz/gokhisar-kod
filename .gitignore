@@ -1,0 +1,12 @@
+﻿.venv/
+__pycache__/
+*.pyc
+*.pt
+*.onnx
+.pytest_cache/
+.vscode/
+Debug/
+*.o
+*.elf
+*.map
+.DS_Store
