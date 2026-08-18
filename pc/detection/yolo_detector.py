@@ -7,7 +7,13 @@ tespit verisidir; doğrulama ve takip modüllerine giriş sağlar.
 from dataclasses import dataclass, field
 
 import numpy as np
-from ultralytics import YOLO
+
+try:
+    from ultralytics import YOLO
+    HAS_ULTRALYTICS = True
+except ImportError:
+    HAS_ULTRALYTICS = False
+    YOLO = None
 
 import config
 
@@ -49,10 +55,19 @@ class Detection:
 
 class YoloDetector:
     def __init__(self, model_path: str = config.YOLO_MODEL_PATH):
-        self.model = YOLO(model_path)
+        if HAS_ULTRALYTICS:
+            try:
+                self.model = YOLO(model_path)
+            except Exception:
+                self.model = None
+        else:
+            self.model = None
 
     def detect(self, frame: np.ndarray) -> list[Detection]:
         """Tam kare üzerinde YOLOv8s çıkarımı."""
+        if self.model is None:
+            return []
+
         results = self.model.predict(
             frame,
             imgsz=config.YOLO_IMG_SIZE,
@@ -79,7 +94,7 @@ class YoloDetector:
         Uzak/küçük hedeflerin etkin çözünürlüğünü artırır."""
         rx1, ry1, rx2, ry2 = roi
         crop = frame[ry1:ry2, rx1:rx2]
-        if crop.size == 0:
+        if crop.size == 0 or self.model is None:
             return []
 
         results = self.model.predict(

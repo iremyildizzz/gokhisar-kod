@@ -62,7 +62,7 @@ class TargetTracker:
                                            tracked.tracker_id):
             tid = int(tid)
             seen.add(tid)
-            det = Detection(*xyxy.tolist(), conf=float(conf),
+            det = Detection(*xyxy.tolist(), conf=float(conf.item() if hasattr(conf, 'item') else conf),
                             class_id=int(cls_id), source="track")
             if tid in self.targets:
                 t = self.targets[tid]
@@ -91,7 +91,7 @@ class TargetTracker:
         if len(t.center_history) < 5:
             return 0.0
         pts = np.array(t.center_history[-20:])
-        jitter = float(np.mean(np.std(pts, axis=0)))
+        jitter = float(np.mean(np.std(pts, axis=0)).item())
         return 1.0 / (1.0 + jitter / 10.0)
 
 
@@ -116,9 +116,9 @@ class ServoKalman:
             self.initialized = True
         self.kf.predict()
         est = self.kf.correct(meas)
-        return float(est[0]), float(est[1])
+        return float(est[0][0]), float(est[1][0])
 
     def predict_only(self) -> tuple[float, float]:
         """Ölçüm yokken yalnızca tahmin adımı — takip sürekliliği."""
         pred = self.kf.predict()
-        return float(pred[0]), float(pred[1])
+        return float(pred[0][0]), float(pred[1][0])

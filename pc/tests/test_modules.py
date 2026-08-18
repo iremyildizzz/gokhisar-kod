@@ -1,4 +1,15 @@
-"""pytest ile otomatize testler (rapor: iteratif prototipleme + pytest)."""
+import os
+import sys
+
+# Modül yollarını ekle
+current_dir = os.path.dirname(os.path.abspath(__file__))
+pc_dir = os.path.dirname(current_dir)
+root_dir = os.path.dirname(pc_dir)
+for d in (root_dir, pc_dir):
+    if d not in sys.path:
+        sys.path.insert(0, d)
+
+import time
 import numpy as np
 import pytest
 
@@ -9,6 +20,7 @@ from iff.friend_foe import FriendFoeClassifier, IFFLabel
 from lifecycle.state_machine import (TargetLifecycleManager, TargetState,
                                      TargetRecord)
 from tracking.tracker import TrackedTarget
+from evaluation.latency_tracker import LatencyTracker
 
 
 def make_frame(color=(0, 0, 0)):
@@ -89,3 +101,31 @@ def test_pid_converges_toward_center(monkeypatch):
     # hata pozitif (hedef sagda/asagida) -> acilar artmali
     assert ctrl.pan_angle > pan0
     assert ctrl.tilt_angle > tilt0
+
+
+# ---------------- Gecikme Ölçer (LatencyTracker) ----------------
+def test_latency_tracker_measurement():
+    tracker = LatencyTracker()
+    t_cap = time.perf_counter()
+    time.sleep(0.005) # 5ms kuyruk gecikmesi simülasyonu
+
+    tracker.record_queue_delay(t_cap)
+    pipe_start = time.perf_counter()
+
+    with tracker.measure("yolo_detection"):
+        time.sleep(0.010) # 10ms yolo simülasyonu
+
+    with tracker.measure("hsv_detection"):
+        time.sleep(0.003) # 3ms hsv simülasyonu
+
+    tracker.record_end_to_end(t_cap, pipe_start)
+
+    summary = tracker.get_summary()
+    assert summary["queue_delay"] >= 4.0
+    assert summary["yolo_detection"] >= 9.0
+    assert summary["hsv_detection"] >= 2.0
+    assert summary["end_to_end"] >= 15.0
+
+    bottleneck, b_ms = tracker.get_bottleneck()
+    assert bottleneck == "yolo_detection"
+    assert b_ms >= 9.0

@@ -7,6 +7,7 @@ kesintisiz kalır ve gecikme birikmez.
 """
 import queue
 import sys
+import time
 
 import cv2
 import numpy as np
@@ -59,7 +60,8 @@ class CaptureWorker(QThread):
             ok, frame = cap.read()
             if not ok:
                 continue
-            self.frame_queue.put(frame)
+            t_capture = time.perf_counter()
+            self.frame_queue.put((frame, t_capture))
             self.frame_ready.emit(frame)
         cap.release()
 
@@ -81,10 +83,14 @@ class PipelineWorker(QThread):
     def run(self):
         while self.running:
             try:
-                frame = self.frame_queue.get(timeout=0.5)
+                item = self.frame_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
-            annotated = self.pipeline.process(frame)
+            if isinstance(item, tuple):
+                frame, t_capture = item
+            else:
+                frame, t_capture = item, 0.0
+            annotated = self.pipeline.process(frame, t_capture=t_capture)
             self.result_ready.emit(annotated)
 
     def stop(self):
