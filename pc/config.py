@@ -3,7 +3,7 @@
 # ---------------- YOLO ----------------
 YOLO_MODEL_PATH = "yolo_modeli.pt"   # eğitilmiş model
 YOLO_IMG_SIZE = 640                  # 480 küçük/uzak balonda kaçırma yapıyordu
-YOLO_CONF_THRESHOLD = 0.15          # balon modeli için 0.35 fazla katı kalabiliyor
+YOLO_CONF_THRESHOLD = 0.15
 YOLO_IOU_THRESHOLD = 0.45
 
 
@@ -38,27 +38,29 @@ HUE_RED_RANGES = [(0, 10), (170, 180)]
 HUE_CYAN_RANGE = (80, 130)
 
 # ---------------- Takip ----------------
-# Sena main (track/performance update) + bizim Kalman/home/servo ayarları
-TRACK_HIGH_CONF = 0.20        # 0.35 -> 0.20: Düşük güvenli hızlı/uzak tespitlerin takibe girmesini sağlar
+# Sticky kanonik ID: ByteTrack raw ID değişse bile #N sabit kalsın
+TRACK_HIGH_CONF = 0.20
 TRACK_LOW_CONF = 0.1
-TRACK_BUFFER = 90             # 60 -> 90: Kaybolan hedef ID'sini daha uzun süre (3 sn @30fps) korur
-TRACK_MATCH_IOU = 0.15        # 0.35 -> 0.15: Hızlı harekette IoU çökmesine karşı esnek örtüşme kabul eder
-TRACK_DEDUPE_IOU = 0.55       # 0.30 -> 0.55: Canlı takipleri çakışma nedeniyle yanlışlıkla silmeyi önler
+TRACK_BUFFER = 90
+TRACK_MATCH_IOU = 0.15
+TRACK_DEDUPE_IOU = 0.55
+TRACK_STICK_IOU = 0.12          # remapping — düşük eşik (ID kaybını kes)
+TRACK_STICK_CENTER_RATIO = 2.5  # merkez yakınlığı ile yapıştır
 DEDUPE_IOU = 0.30
 DEDUPE_CENTER_RATIO = 1.1
-TRACK_MAX_DRAW_MISSES = 2     # UI: 2 kareye kadar coast/tahmin çiz
+TRACK_MAX_DRAW_MISSES = 20
 
 # Hafif Re-ID & Kamera Hareket Dengeleme (GMC)
-ENABLE_GMC = True             # Pan/Tilt kamera sarsıntısını piksel düzleminde telafi et
-ENABLE_REID = True            # HSV Renk Parmak İzi ile ID kurtarma (Re-Identification)
-REID_SIMILARITY_THRESHOLD = 0.65  # Benzerlik eşiği (0.0 - 1.0)
-REID_MAX_DISTANCE_PX = 180.0  # Maksimum kabul edilebilir merkez mesafesi (px)
+ENABLE_GMC = True
+ENABLE_REID = True
+REID_SIMILARITY_THRESHOLD = 0.55
+REID_MAX_DISTANCE_PX = 240.0
 
-# Per-track + servo Kalman — ölçüme daha çok güven (lag/osalasyon azalsın)
-TRACK_KALMAN_PROCESS = 2e-2
-TRACK_KALMAN_MEASURE = 3e-2
-TRACK_CANDIDATE_MAX_MISSES = 5
-# İleri bakış kapalı (tavana fırlatıyordu)
+# Per-track + servo Kalman — ölçüme daha çok güven
+TRACK_KALMAN_PROCESS = 3e-2
+TRACK_KALMAN_MEASURE = 2e-2
+TRACK_CANDIDATE_MAX_MISSES = 25  # kısa miss'te aday düşmesin
+CANDIDATE_HOLD_FRAMES = 20       # select None olsa bile adayı tut
 SERVO_KALMAN_LEAD_S = 0.0
 SERVO_TARGET_MAX_JUMP_PX = 20.0
 
@@ -71,11 +73,12 @@ SERVO_TILT_HOME_DEG = 80.0
 SERVO_ELEVATION_HOME_UI = -10  # -15 fazla aşağıydı
 
 # ---------------- Değerlendirme / Önceliklendirme (5 Ölçüt) ----------------
-W_SIZE = 0.35                  # hedef boyut ağırlığı
-W_CENTER = 0.25                # kamera merkezine yakınlık ağırlığı
-W_STABILITY = 0.20             # takip kararlılığı ağırlığı
-W_ENGAGEMENT = 0.10            # angajman uygunluğu ağırlığı (IFF)
-W_SERVO = 0.10                 # servo yönelim kararlılığı ağırlığı
+W_SIZE = 0.35
+W_CENTER = 0.25
+W_STABILITY = 0.20
+W_ENGAGEMENT = 0.10
+W_SERVO = 0.10
+CANDIDATE_HYSTERESIS = 0.20
 
 # ---------------- Kilitlenme (balon nişanı) ----------------
 # 640 genişlikte ~aynı açısal bant (~90 px @1280)

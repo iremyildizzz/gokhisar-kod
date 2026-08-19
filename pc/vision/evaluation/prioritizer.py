@@ -25,7 +25,7 @@ class TargetPrioritizer:
         if not t.servo_corrections:
             return 0.5
         mean_corr = float(np.mean(np.abs(t.servo_corrections[-20:])))
-        return 1.0 / (1.0 + mean_corr / 5.0)
+        return 1.0 / (1.0 + mean_corr / 15.0)
 
     def score(self, t: TrackedTarget, iff_label: IFFLabel = IFFLabel.FOE) -> float:
         """5 ölçütün ağırlıklı toplamıyla öncelik puanını hesaplar (0..1)."""
@@ -58,10 +58,17 @@ class TargetPrioritizer:
                 + config.W_ENGAGEMENT * engagement_score
                 + config.W_SERVO * servo_score)
 
-    def select(self, targets: list[TrackedTarget] | list[tuple[TrackedTarget, IFFLabel]]) -> TrackedTarget | None:
-        """Düşman doğrulanmış hedefler arasından 5 ölçütlü puanla angajman adayını seç."""
+    def select(self, targets: list[TrackedTarget] | list[tuple[TrackedTarget, IFFLabel]],
+               current_candidate_id: int | None = None) -> TrackedTarget | None:
+        """Düşman doğrulanmış hedefler arasından 5 ölçütlü puanla angajman adayını seç.
+        
+        current_candidate_id verilirse, mevcut adaya Hysteresis (bağlılık) primi verilir;
+        böylece yakın puanlı hedefler arasında sürekli aday sıçraması (chatter) önlenir.
+        """
         if not targets:
             return None
+
+        hysteresis = float(getattr(config, "CANDIDATE_HYSTERESIS", 0.15))
 
         candidates = []
         for item in targets:
@@ -69,7 +76,12 @@ class TargetPrioritizer:
                 target, iff_label = item
             else:
                 target, iff_label = item, IFFLabel.FOE
-            candidates.append((target, self.score(target, iff_label)))
+            
+            raw_score = self.score(target, iff_label)
+            # Mevcut aday ise bağlılık primi (hysteresis) ekle
+            bonus = hysteresis if (current_candidate_id is not None and target.track_id == current_candidate_id) else 0.0
+            candidates.append((target, raw_score + bonus))
 
         candidates.sort(key=lambda c: c[1], reverse=True)
         return candidates[0][0]
+

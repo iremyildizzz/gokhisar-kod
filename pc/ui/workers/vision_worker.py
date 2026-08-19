@@ -261,7 +261,6 @@ class VisionWorker(BaseWorker):
             if view.locked:
                 color = COLOR_LOCKED
             elif getattr(view, "predicted", False):
-                # Kalman tahmini — ölçüm yok, kutu ilerliyor
                 color = (180, 180, 220)
             elif is_balloon:
                 color = COLOR_BALLOON

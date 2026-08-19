@@ -176,6 +176,7 @@ class VisionPipeline:
         self._frame_size = (vision_config.FRAME_WIDTH, vision_config.FRAME_HEIGHT)
         self._known_track_ids: set[int] = set()
         self._candidate_id: int | None = None
+        self._candidate_hold: int = 0
         self._last_fps: int = 30
 
     # ------------------------------------------------------------------
@@ -234,6 +235,7 @@ class VisionPipeline:
         self.latency.reset()
         self._known_track_ids.clear()
         self._candidate_id = None
+        self._candidate_hold = 0
 
     # ------------------------------------------------------------------
     # Kare işleme
@@ -476,11 +478,13 @@ class VisionPipeline:
 
         Balon-only modelde maket+IFF yok; balonlar doğrudan takip adayı olur
         (servo merkeze götürsün). Ateş kararı ayrı kapılarda kalır.
+        Kısa miss'te aday ID tutulur (CANDIDATE_HOLD_FRAMES).
         """
         # Test/KTR: kısa miss'te Kalman tahmini varken adayı hemen bırakma
         max_miss = int(getattr(vision_config, "TRACK_CANDIDATE_MAX_MISSES", 5))
         if getattr(vision_config, "TRACKING_TEST_MODE", False):
             max_miss = max(max_miss, 8)
+        hold_max = int(getattr(vision_config, "CANDIDATE_HOLD_FRAMES", 15))
         candidates_input = []
         for track_id, target in tracked.items():
             if target.det.class_id == BALLOON_CLASS_ID:
@@ -505,9 +509,46 @@ class VisionPipeline:
                 continue
             if record.state in (TargetState.EVALUATE, TargetState.TARGET_LOCK):
                 candidates_input.append((target, record.iff))
-        candidate = self.prioritizer.select(candidates_input)
+        candidate = self.prioritizer.select(
+            candidates_input, current_candidate_id=self._candidate_id
+        )
+
+        # Sticky: mevcut aday hâlâ tracked'te ve miss limitindeyse zorla tut
+        if (
+            candidate is not None
+            and self._candidate_id is not None
+            and self._candidate_id in tracked
+            and tracked[self._candidate_id].misses <= max_miss
+        ):
+            held = tracked[self._candidate_id]
+            # Prioritizer başka ID seçse bile kısa süreli chatter'ı kes
+            if candidate.track_id != self._candidate_id:
+                # Aynı sınıf + yakınsa eski adayı koru
+                if held.det.class_id == candidate.det.class_id:
+                    candidate = held
+
+        if candidate is None and self._candidate_id is not None:
+            held = tracked.get(self._candidate_id)
+            if held is not None and held.misses <= max_miss:
+                candidate = held
+                self._candidate_hold = 0
+            elif self._candidate_hold < hold_max:
+                self._candidate_hold += 1
+                # Track tamamen düştüyse bile hold süresi dolana kadar ID'yi bırakma
+                # (UI "Hedef kaybedildi" spam'ini kes); view için track yoksa None.
+                if held is not None:
+                    candidate = held
+            else:
+                self._candidate_id = None
+                self._candidate_hold = 0
+        elif candidate is not None:
+            self._candidate_hold = 0
+
         if candidate is not None:
             self.lifecycle.on_selected_for_lock(candidate.track_id)
+            self._candidate_id = candidate.track_id
+        elif self._candidate_hold <= 0:
+            self._candidate_id = None
         return candidate
 
     def _update_lock(self, candidate: TrackedTarget | None) -> bool:

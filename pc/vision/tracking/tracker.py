@@ -1,15 +1,9 @@
-"""Hedef Takip Modülü — ByteTrack + KTR Kalman gelecek tahmini.
+"""Hedef Takip Modülü — ByteTrack + Sena bytetrackupdate2 ID map.
 
 KTR 4.2.2.4:
-  • ByteTrack: IoU + Macar; yüksek güven önce, düşük güven telafi turu
-  • Ölçüm yokken yalnız tahmin adımı (predict)
-  • ByteTrack'ten bağımsız ikinci Kalman: merkez konumunu yumuşatır /
-    kısa kayıpta gelecek konumu tahmin eder (ServoKalman + per-track)
-
-Akış:
-  tespitler → ByteTrack (kimlik) → her iz için TrackKalman
-  ölçüm var  → predict+correct → filtrelenmiş kutu
-  ölçüm yok  → predict_only   → kutu hızla ilerler (donmuş hayalet yok)
+  • ByteTrack kimlik
+  • ID map / Re-ID — ByteTrack ID değişse bile kanonik ID kalır
+  • Ölçüm yokken coast (TRACK_BUFFER)
 """
 from __future__ import annotations
 
@@ -256,6 +250,8 @@ class TrackedTarget:
 
 
 class TargetTracker:
+    """ByteTrack + sticky kanonik ID (raw ID değişse #N sabit)."""
+
     def __init__(self, fps: int = 30):
         self.tracker = sv.ByteTrack(
             track_activation_threshold=config.TRACK_HIGH_CONF,
@@ -269,9 +265,9 @@ class TargetTracker:
         self.gmc = GlobalMotionCompensator()
         self.reid = LightweightHistogramReID()
         self.lost_pool: dict[int, TrackedTarget] = {}
+        self._id_map: dict[int, int] = {}
 
     def set_fps(self, fps: int) -> None:
-        """Ölçülen pipeline FPS → ByteTrack zaman adımı (Sena track update)."""
         if hasattr(self.tracker, "frame_rate"):
             self.tracker.frame_rate = max(1, int(fps))
 
@@ -288,9 +284,11 @@ class TargetTracker:
                 oldest_id = next(iter(self.lost_pool))
                 self.lost_pool.pop(oldest_id, None)
         self._kalmans.pop(track_id, None)
+        self._id_map = {
+            raw_k: can_v for raw_k, can_v in self._id_map.items() if can_v != track_id
+        }
 
     def _coast_missing(self, tid: int, dx: float = 0.0, dy: float = 0.0) -> None:
-        """Ölçüm yok: Kalman predict + GMC ötelenmesi + kutuyu ilerlet (hayalet donmasın)."""
         t = self.targets[tid]
         t.misses += 1
         if t.misses > config.TRACK_BUFFER:
@@ -309,37 +307,154 @@ class TargetTracker:
         if len(t.center_history) > 60:
             t.center_history.pop(0)
 
-    def _try_reid_match(self, det: Detection, feat: np.ndarray | None) -> int | None:
-        """Kayıp iz havuzundan aynı görsel parmak izine sahip ID bulur."""
-        if feat is None or not getattr(config, "ENABLE_REID", True):
-            return None
-        best_id = None
-        best_sim = float(getattr(config, "REID_SIMILARITY_THRESHOLD", 0.65))
-        max_dist = float(getattr(config, "REID_MAX_DISTANCE_PX", 180.0))
+    def _stick_iou(self) -> float:
+        return float(getattr(config, "TRACK_STICK_IOU", 0.12))
+
+    def _stick_center_ratio(self) -> float:
+        return float(getattr(config, "TRACK_STICK_CENTER_RATIO", 2.5))
+
+    def _try_active_stick(self, det: Detection) -> int | None:
+        """Yeni ByteTrack ID → mevcut kanonik ID (gevşek IoU/merkez).
+
+        En yaşlı / en düşük ID tercih edilir; böylece #1 varken #2 açılmaz.
+        """
+        stick_iou = self._stick_iou()
+        stick_center = self._stick_center_ratio()
+        best_id: int | None = None
+        best_key: tuple[int, int] | None = None  # (-age, id) → max age, min id
+        for act_id, act_t in self.targets.items():
+            if act_t.det.class_id != det.class_id:
+                continue
+            if not boxes_same_object(
+                act_t.det.as_xyxy(),
+                det.as_xyxy(),
+                iou_threshold=stick_iou,
+                center_ratio=stick_center,
+            ):
+                continue
+            key = (-act_t.age, act_id)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_id = act_id
+        return best_id
+
+    def _try_lost_stick(self, det: Detection, feat: np.ndarray | None) -> int | None:
+        """lost_pool'dan geri al — Re-ID veya sadece merkez yakınlığı."""
+        max_dist = float(getattr(config, "REID_MAX_DISTANCE_PX", 220.0))
+        stick_iou = self._stick_iou()
+        stick_center = self._stick_center_ratio()
+        best_id: int | None = None
+        best_score = -1.0
+        use_reid = bool(getattr(config, "ENABLE_REID", True))
+        reid_thr = float(getattr(config, "REID_SIMILARITY_THRESHOLD", 0.55))
 
         for lost_id, lost_t in list(self.lost_pool.items()):
             if lost_t.det.class_id != det.class_id:
                 continue
             dist = math.hypot(lost_t.det.cx - det.cx, lost_t.det.cy - det.cy)
-            if dist > max_dist:
+            near = dist <= max_dist or boxes_same_object(
+                lost_t.det.as_xyxy(),
+                det.as_xyxy(),
+                iou_threshold=stick_iou,
+                center_ratio=stick_center,
+            )
+            if not near:
                 continue
-            sim = self.reid.similarity(feat, lost_t.feature)
-            if sim > best_sim:
-                best_sim = sim
+            score = 1.0 / (1.0 + dist)
+            if use_reid and feat is not None and lost_t.feature is not None:
+                sim = self.reid.similarity(feat, lost_t.feature)
+                if sim >= reid_thr:
+                    score += float(sim)
+                elif dist > max_dist * 0.5:
+                    continue
+            if score > best_score:
+                best_score = score
                 best_id = lost_id
-
         return best_id
 
-    @staticmethod
-    def _suppress_overlapping(tracked: sv.Detections) -> sv.Detections:
-        """Aynı sınıfta yüksek örtüşen takiplerden yalnızca en güvenilir olanı bırak."""
+    def _resolve_canonical_id(
+        self, raw_tid: int, det: Detection, feat: np.ndarray | None
+    ) -> int:
+        """ByteTrack raw ID → sabit kanonik ID (bir kez bağlanınca kopmaz)."""
+        if raw_tid in self._id_map:
+            mapped = self._id_map[raw_tid]
+            if mapped in self.targets or mapped in self.lost_pool:
+                if mapped in self.lost_pool and mapped not in self.targets:
+                    self.targets[mapped] = self.lost_pool.pop(mapped)
+                return mapped
+            # Eski map çürükse yeniden çöz
+            self._id_map.pop(raw_tid, None)
+
+        matched = self._try_active_stick(det)
+        if matched is not None:
+            self._id_map[raw_tid] = matched
+            return matched
+
+        lost_matched = self._try_lost_stick(det, feat)
+        if lost_matched is not None:
+            restored = self.lost_pool.pop(lost_matched)
+            self.targets[lost_matched] = restored
+            self._id_map[raw_tid] = lost_matched
+            return lost_matched
+
+        self._id_map[raw_tid] = raw_tid
+        return raw_tid
+
+    def _merge_duplicate_targets(self, seen: set[int]) -> set[int]:
+        """Aynı nesneye iki kanonik ID düşerse yaşlıyı tut, yeniyi yut."""
+        stick_iou = self._stick_iou()
+        stick_center = self._stick_center_ratio()
+        ids = list(self.targets.keys())
+        for i, a_id in enumerate(ids):
+            if a_id not in self.targets:
+                continue
+            for b_id in ids[i + 1 :]:
+                if b_id not in self.targets:
+                    continue
+                a_t, b_t = self.targets[a_id], self.targets[b_id]
+                if a_t.det.class_id != b_t.det.class_id:
+                    continue
+                if not boxes_same_object(
+                    a_t.det.as_xyxy(),
+                    b_t.det.as_xyxy(),
+                    iou_threshold=stick_iou,
+                    center_ratio=stick_center,
+                ):
+                    continue
+                # Yaşlı / küçük ID kalsın
+                if (a_t.age, -a_id) >= (b_t.age, -b_id):
+                    keep, drop = a_id, b_id
+                else:
+                    keep, drop = b_id, a_id
+                if drop in seen and keep not in seen:
+                    # Ölçüm yeni IDdeydi → yaşlıya taşı
+                    self.targets[keep].det = self.targets[drop].det
+                    self.targets[keep].misses = 0
+                    self.targets[keep].predicted = False
+                    seen.add(keep)
+                    seen.discard(drop)
+                for raw_k, can_v in list(self._id_map.items()):
+                    if can_v == drop:
+                        self._id_map[raw_k] = keep
+                # Mükerrer: lost_pool'a koyma (yoksa #2 tekrar doğar)
+                self.targets.pop(drop, None)
+                self._kalmans.pop(drop, None)
+                self.lost_pool.pop(drop, None)
+        return seen
+
+    def _suppress_overlapping(self, tracked: sv.Detections) -> sv.Detections:
         n = len(tracked)
         if n <= 1:
             return tracked
 
-        order = sorted(
-            range(n), key=lambda i: _as_float(tracked.confidence[i]), reverse=True
-        )
+        def sort_key(i: int) -> float:
+            raw_tid = _as_int(tracked.tracker_id[i]) if tracked.tracker_id is not None else -1
+            can_id = self._id_map.get(raw_tid, raw_tid)
+            is_active = 1.0 if can_id in self.targets else 0.0
+            conf = _as_float(tracked.confidence[i])
+            return is_active * 2.0 + conf
+
+        order = sorted(range(n), key=sort_key, reverse=True)
         keep: list[int] = []
         for i in order:
             cls_i = _as_int(tracked.class_id[i])
@@ -357,7 +472,6 @@ class TargetTracker:
 
     @staticmethod
     def _to_sv(detections: list[Detection]) -> sv.Detections:
-        """Birleşik tespit listesi -> supervision formatı."""
         valid_dets = [d for d in detections if d.conf >= config.TRACK_LOW_CONF]
         if not valid_dets:
             return sv.Detections.empty()
@@ -370,7 +484,6 @@ class TargetTracker:
     def update(
         self, detections: list[Detection], frame: np.ndarray | None = None
     ) -> dict[int, TrackedTarget]:
-        """ByteTrack kimlik + Re-ID + GMC + TrackKalman konum."""
         dx, dy = 0.0, 0.0
         if getattr(config, "ENABLE_GMC", True) and frame is not None:
             active_boxes = [t.det.as_xyxy() for t in self.targets.values()]
@@ -394,34 +507,22 @@ class TargetTracker:
             return self.targets
 
         seen: set[int] = set()
-        for xyxy, conf, cls_id, tid in zip(
+        for xyxy, conf, cls_id, raw_tid in zip(
             tracked.xyxy,
             tracked.confidence,
             tracked.class_id,
             tracked.tracker_id,
         ):
-            tid = _as_int(tid)
+            raw_tid = _as_int(raw_tid)
             x1, y1, x2, y2 = (float(v) for v in np.asarray(xyxy).reshape(-1)[:4])
             raw = Detection(
-                x1,
-                y1,
-                x2,
-                y2,
+                x1, y1, x2, y2,
                 conf=_as_float(conf),
                 class_id=_as_int(cls_id),
                 source="track",
             )
             feat = self.reid.extract_feature(frame, (x1, y1, x2, y2))
-
-            # Yeni iz oluştuğunda kayıp havuzundan Re-ID kontrolü yap
-            if tid not in self.targets:
-                reid_matched_id = self._try_reid_match(raw, feat)
-                if reid_matched_id is not None:
-                    restored_t = self.lost_pool.pop(reid_matched_id)
-                    self._drop(tid)
-                    tid = reid_matched_id
-                    self.targets[tid] = restored_t
-
+            tid = self._resolve_canonical_id(raw_tid, raw, feat)
             seen.add(tid)
             self._kf(tid).update(raw.cx, raw.cy)
             det = raw
@@ -448,29 +549,19 @@ class TargetTracker:
             if len(t.center_history) > 60:
                 t.center_history.pop(0)
 
+        seen = self._merge_duplicate_targets(seen)
+
         for tid in list(self.targets):
             if tid in seen:
                 continue
-            t = self.targets[tid]
-            if any(
-                other.det.class_id == t.det.class_id
-                and boxes_same_object(
-                    t.det.as_xyxy(),
-                    other.det.as_xyxy(),
-                    iou_threshold=config.TRACK_DEDUPE_IOU,
-                )
-                for other_id, other in self.targets.items()
-                if other_id in seen
-            ):
-                self._drop(tid)
-                continue
+            # Eski davranış: örtüşen coast ID'yi düşürüyordu → #1 kaybolup #2 kalıyordu.
+            # Artık coast devam; mükerrerler _merge_duplicate_targets'ta çözülür.
             self._coast_missing(tid, dx, dy)
 
         return self.targets
 
     @staticmethod
     def stability(t: TrackedTarget) -> float:
-        """Merkez geçmişindeki oynaklıktan 0-1 arası kararlılık metriği."""
         if len(t.center_history) < 5:
             return 0.0
         pts = np.array(t.center_history[-20:])
