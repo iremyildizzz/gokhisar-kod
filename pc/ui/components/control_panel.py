@@ -54,11 +54,11 @@ _AXIS_LABEL_ACTIVE = ("color:#c8cdd6;font-size:11px;font-weight:600;"
 _AXIS_LABEL_PASSIVE = ("color:#6b7280;font-size:11px;font-weight:600;"
                        "background:transparent;border:none;")
 
-# PID — preset adı: iyi_yatay (yatay kilit için iyi bulunan)
+# PID — preset: en_iyi_dikey (pan iyi + tilt yumuşak/frenli)
 _DEFAULT_KP = 0.034
 _DEFAULT_KI = 0.0
 _DEFAULT_KD = 0.010
-_PID_PRESET_NAME = "iyi_yatay"
+_PID_PRESET_NAME = "en_iyi_dikey"
 
 
 class ServoControlWidget(QFrame):
@@ -114,7 +114,7 @@ class ServoControlWidget(QFrame):
         self.x_slider.valueChanged.connect(lambda v:(self.x_value.setText(f"{v}°"),self._emit()))
         self.y_slider.valueChanged.connect(lambda v:(self.y_value.setText(f"{v}°"),self._emit()))
 
-        # PID — 3 sütun yan yana (preset: iyi_yatay)
+        # PID — 3 sütun yan yana (preset: en_iyi_dikey)
         pid_hdr = QLabel(f"PID · {_PID_PRESET_NAME}")
         pid_hdr.setStyleSheet(
             "color:#9aa4b2;font-size:10px;font-weight:700;"

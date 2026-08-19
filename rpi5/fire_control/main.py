@@ -10,19 +10,22 @@ from .engagement import distance_allows_fire, engage_range_for
 from .lidar_tf02 import TF02Pro
 from .optics import GS_16MM, CameraOptics
 from .pid import PID, PIDGains
+from .pid_presets import PRESETS, resolve_tilt_gains, tilt_gravity_ff
 from .protocol import DownlinkCommand
 from .tcp_server import MissionState, TcpJsonServer
 from .uart_bridge import Stm32Bridge
+from .video_stream import VideoStreamer
 
 
 @dataclass
 class Limits:
-    # gokhisar servo uzayı: 0…180°, orta = 90°
+    # gokhisar servo uzayı: 0…180°
     pan_min: float = 0.0
     pan_max: float = 180.0
     tilt_min: float = 0.0
     tilt_max: float = 180.0
-    home_deg: float = 90.0
+    home_pan_deg: float = 90.0
+    home_tilt_deg: float = 80.0  # UI elev −10°
     engage_err_deg: float = 0.35
     engage_stable_s: float = 1.0  # menzilde kararlı kalma
 
@@ -46,7 +49,27 @@ def run(args: argparse.Namespace) -> None:
     limits = Limits(engage_stable_s=args.engage_stable)
     optics: CameraOptics = GS_16MM
     state = MissionState(frame_w=args.frame_w, frame_h=args.frame_h)
-    tcp = TcpJsonServer(host=args.tcp_host, port=args.tcp_port, state=state)
+    # Kamera: Pi sürekli PC'ye UDP yayınlar. Arayüz sadece dinler / kapatır;
+    # Pi tarafı fire_control kapanana kadar akar.
+    video = VideoStreamer(
+        width=args.video_width,
+        height=args.video_height,
+        fps=args.video_fps,
+        port=args.video_port,
+        enabled=not args.no_video,
+    )
+
+    def _on_connect(peer: str) -> None:
+        # --video-host verilmediyse ilk TCP istemcisinin IP'sine yayın başlat
+        if video.enabled and not args.video_host and not video.running:
+            video.start(peer, args.video_port)
+
+    tcp = TcpJsonServer(
+        host=args.tcp_host,
+        port=args.tcp_port,
+        state=state,
+        on_client_connect=_on_connect,
+    )
     bridge = Stm32Bridge(port=args.stm_port, baud=args.baud)
 
     lidar = None
@@ -56,13 +79,45 @@ def run(args: argparse.Namespace) -> None:
         except Exception as exc:  # noqa: BLE001
             print(f"[WARN] LiDAR açılamadı: {exc}")
 
+    kp_t, ki_t, kd_t = resolve_tilt_gains(
+        args.kp, args.ki, args.kd, args.kp_tilt, args.ki_tilt, args.kd_tilt
+    )
     pid_x = PID(PIDGains(kp=args.kp, ki=args.ki, kd=args.kd, output_limit=args.out_limit))
-    pid_y = PID(PIDGains(kp=args.kp, ki=args.ki, kd=args.kd, output_limit=args.out_limit))
+    # Tilt: daha yumuşak P + daha sert D (dikey overshoot / kaçırma)
+    pid_y = PID(
+        PIDGains(
+            kp=kp_t,
+            ki=ki_t,
+            kd=kd_t,
+            output_limit=args.out_limit,
+            near_p_scale=0.18,
+            near_out_scale=0.30,
+            deadzone_deg=0.22,
+        )
+    )
 
-    pan = limits.home_deg
-    tilt = limits.home_deg
+    pan = limits.home_pan_deg
+    tilt = limits.home_tilt_deg
     in_range_since: float | None = None
     stop = False
+
+    def _apply_pid_from_pc(kp: float, ki: float, kd: float) -> None:
+        """YKİ tek P/I/D gönderir; pan aynen, tilt preset oranıyla yumuşatılır."""
+        pid_x.set_gains(kp, ki, kd)
+        # Mutlak --kp-tilt verilmişse onu koru; yoksa pan'a göre oranla.
+        if args.kp_tilt is not None and args.kp and args.kp != 0.0:
+            scale_p = args.kp_tilt / args.kp
+            scale_d = (args.kd_tilt / args.kd) if args.kd and args.kd_tilt is not None else 2.2
+            pid_y.set_gains(kp * scale_p, ki, kd * scale_d)
+        else:
+            t_kp, t_ki, t_kd = resolve_tilt_gains(
+                kp, ki, kd, args.kp_tilt, args.ki_tilt, args.kd_tilt
+            )
+            pid_y.set_gains(t_kp, t_ki, t_kd)
+        print(
+            f"[OK] PID pan P={pid_x.gains.kp:.3f} D={pid_x.gains.kd:.3f} | "
+            f"tilt P={pid_y.gains.kp:.3f} D={pid_y.gains.kd:.3f}"
+        )
 
     def _stop(*_a: object) -> None:
         nonlocal stop
@@ -72,9 +127,31 @@ def run(args: argparse.Namespace) -> None:
     signal.signal(signal.SIGTERM, _stop)
 
     tcp.start()
+    video_ok = False
+    if video.enabled and args.video_host:
+        video_ok = video.start(args.video_host, args.video_port)
+
     print(f"[OK] TCP JSON : {args.tcp_host}:{args.tcp_port} (gokhisar uyumlu)")
     print(f"[OK] Frame merkezi: {args.frame_w}x{args.frame_h}")
     print(f"[OK] STM32 UART: {args.stm_port} @ {args.baud}")
+    if not video.enabled:
+        print("[OK] Video: kapalı (--no-video)")
+    elif args.video_host:
+        if video_ok:
+            print(
+                f"[OK] Video sürekli → {args.video_host}:{args.video_port} "
+                f"({args.video_width}x{args.video_height}@{args.video_fps})"
+            )
+        else:
+            print(
+                f"[HATA] Video başlamadı (hedef {args.video_host}:{args.video_port}). "
+                "rpicam-vid + gst-launch-1.0 kurulu mu?"
+            )
+    else:
+        print(
+            f"[OK] Video: ilk TCP bağlanınca peer'e UDP:{args.video_port} "
+            "(sürekli; arayüz kapansa da akar)"
+        )
     print(
         f"[OK] Optik GS+16mm: HFOV≈{optics.hfov_deg:.1f}° VFOV≈{optics.vfov_deg:.1f}°"
     )
@@ -92,14 +169,19 @@ def run(args: argparse.Namespace) -> None:
             if lidar:
                 lidar.poll()
 
-            gains = state.consume_pid_gains()
-            if gains is not None:
-                pid_x.set_gains(*gains)
-                pid_y.set_gains(*gains)
-                print(f"[PID] kp={gains[0]} ki={gains[1]} kd={gains[2]}")
-
             snap = state.snapshot()
             stage = int(snap.stage)
+
+            if snap.pid_dirty and snap.mode == "otonom" and stage >= 2:
+                if snap.pid_kp is not None:
+                    _apply_pid_from_pc(
+                        float(snap.pid_kp),
+                        float(snap.pid_ki or 0.0),
+                        float(snap.pid_kd or 0.0),
+                    )
+                state.clear_pid_dirty()
+            elif snap.pid_dirty:
+                state.clear_pid_dirty()
 
             home = False
             with state.lock:
@@ -127,44 +209,72 @@ def run(args: argparse.Namespace) -> None:
                 continue
 
             if home:
-                pan = limits.home_deg
-                tilt = limits.home_deg
+                pan = limits.home_pan_deg
+                tilt = limits.home_tilt_deg
                 pid_x.reset()
                 pid_y.reset()
 
-            # --- Manuel adım (gokhisar dx/dy) ---
-            dpan, dtilt = state.consume_manual_delta()
-            if dpan or dtilt:
-                pan += dpan
-                tilt += dtilt
-                pid_x.reset()
-                pid_y.reset()
-                stage = max(stage, 1)
-
+            # KTR 4.3:
+            #   MANUEL → klavye dx/dy (PID yok)
+            #   OTONOM 2/3 → hedef merkezi + PID (klavye yok)
             err_pan_deg = 0.0
             err_tilt_deg = 0.0
 
-            # Aşama-1 / manuel absolute servo
-            if stage <= 1 and snap.mode == "manuel":
-                if snap.pan_cmd_deg is not None:
-                    pan = snap.pan_cmd_deg
-                if snap.tilt_cmd_deg is not None:
-                    tilt = snap.tilt_cmd_deg
-            elif snap.mode == "otonom" or stage >= 2:
+            if snap.mode == "manuel":
+                dpan, dtilt = state.consume_manual_delta()
+                # Pan tersi PC SERVO_INVERT_PAN'da; burada tekrar çevirme
+                if args.invert_y:
+                    dtilt = -dtilt
+                if dpan or dtilt:
+                    pan += dpan
+                    tilt += dtilt
+                    stage = max(stage, 1)
+                with state.lock:
+                    if state.pan_cmd_deg is not None:
+                        pan = state.pan_cmd_deg
+                        state.pan_cmd_deg = None
+                    if state.tilt_cmd_deg is not None:
+                        tilt = state.tilt_cmd_deg
+                        state.tilt_cmd_deg = None
+                pid_x.reset()
+                pid_y.reset()
+
+            elif snap.mode == "otonom" and stage >= 2:
+                state.consume_manual_delta()
+                target_fresh = (
+                    snap.target_mono > 0.0 and (now - snap.target_mono) < 0.4
+                )
                 err_pan_deg, err_tilt_deg = optics.pixel_offset_to_deg(
                     snap.err_x,
                     snap.err_y,
                     frame_w=snap.frame_w,
                     frame_h=snap.frame_h,
                 )
-                if snap.locked or snap.engage_active:
-                    sx = -1.0 if args.invert_x else 1.0
+                has_target = target_fresh and (
+                    snap.track_id >= 0 or snap.class_id >= 0
+                )
+                if has_target or snap.engage_active:
+                    # Pan yönü PC SERVO_INVERT_PAN_AUTO ile ayarlanır — burada çevirme.
                     sy = -1.0 if args.invert_y else 1.0
-                    pan += sx * pid_x.step(err_pan_deg, dt)
-                    tilt += sy * pid_y.step(err_tilt_deg, dt)
+                    dpan = pid_x.step(err_pan_deg, dt)
+                    dtilt = sy * pid_y.step(err_tilt_deg, dt)
+                    pan += dpan
+                    tilt += dtilt
+                    if now - last_status >= 0.25:
+                        print(
+                            f"[OTONOM] id={snap.track_id} "
+                            f"err=({err_pan_deg:+.2f},{err_tilt_deg:+.2f})° "
+                            f"Δ=({dpan:+.2f},{dtilt:+.2f}) "
+                            f"→ pan={pan:.1f} tilt={tilt:.1f}"
+                        )
                 else:
                     pid_x.reset()
                     pid_y.reset()
+
+            else:
+                state.consume_manual_delta()
+                pid_x.reset()
+                pid_y.reset()
 
             pan = clamp(pan, limits.pan_min, limits.pan_max)
             tilt = clamp(tilt, limits.tilt_min, limits.tilt_max)
@@ -227,16 +337,22 @@ def run(args: argparse.Namespace) -> None:
                     and range_stable
                 )
 
+            # Yerçekimi FF: state'teki tilt birikmez; STM komutuna eklenir.
+            tilt_cmd = tilt_gravity_ff(
+                tilt, args.tilt_gravity_kg, args.tilt_gravity_mode
+            )
+            tilt_cmd = clamp(tilt_cmd, limits.tilt_min, limits.tilt_max)
+
             sent = bridge.send(
                 DownlinkCommand(
                     pan_deg=pan,
-                    tilt_deg=tilt,
+                    tilt_deg=tilt_cmd,
                     fire=want_fire,
                     arm=snap.arm and allow_iff,
                     heartbeat=True,
                     home=home,
                     safe=False,
-                    enable=snap.enable,
+                    enable=True,  # manuel/otonom: STM açı alsın
                     stage=stage,
                 )
             )
@@ -258,6 +374,8 @@ def run(args: argparse.Namespace) -> None:
                     "class_name": snap.class_name,
                     "pan_deg": round(pan, 2),
                     "tilt_deg": round(tilt, 2),
+                    "tilt_cmd_deg": round(tilt_cmd, 2),
+                    "tilt_gravity_ff": round(tilt_cmd - tilt, 3),
                     "err_px": {"x": round(snap.err_x, 1), "y": round(snap.err_y, 1)},
                     "err_deg": {"pan": round(err_pan_deg, 3), "tilt": round(err_tilt_deg, 3)},
                     "frame": [snap.frame_w, snap.frame_h],
@@ -270,13 +388,6 @@ def run(args: argparse.Namespace) -> None:
                     "range_stable": range_stable,
                     "range_reason": range_reason,
                     "want_fire": want_fire,
-                    # YKİ'nin gösterdiği katsayıların gerçekten uygulandığını
-                    # operatör telemetriden doğrulayabilsin.
-                    "pid": {
-                        "kp": pid_x.gains.kp,
-                        "ki": pid_x.gains.ki,
-                        "kd": pid_x.gains.kd,
-                    },
                     "stm": None
                     if tel is None
                     else {
@@ -298,6 +409,7 @@ def run(args: argparse.Namespace) -> None:
             )
         except Exception:  # noqa: BLE001
             pass
+        video.stop()
         tcp.stop()
         bridge.close()
         if lidar:
@@ -309,22 +421,109 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Hava savunma atış kontrol — RPi5")
     p.add_argument("--tcp-host", default="0.0.0.0")
     p.add_argument("--tcp-port", type=int, default=5005, help="gokhisar RPI_PORT")
-    p.add_argument("--frame-w", type=int, default=1280, help="PC FRAME_WIDTH (cx merkezi)")
-    p.add_argument("--frame-h", type=int, default=720, help="PC FRAME_HEIGHT (cy merkezi)")
+    p.add_argument("--frame-w", type=int, default=640, help="PC FRAME_WIDTH (cx merkezi)")
+    p.add_argument("--frame-h", type=int, default=480, help="PC FRAME_HEIGHT (cy merkezi)")
     p.add_argument("--stm-port", default="/dev/ttyAMA0", help="STM32 UART")
     p.add_argument("--baud", type=int, default=115200)
     p.add_argument("--lidar-port", default="/dev/ttyAMA1", help="TF02-PRO; boş = kapalı")
     p.add_argument("--lidar-baud", type=int, default=115200)
     p.add_argument("--engage-stable", type=float, default=1.0, help="Aşama-3 menzil kararlılık sn")
-    p.add_argument("--kp", type=float, default=0.55)
-    p.add_argument("--ki", type=float, default=0.05)
-    p.add_argument("--kd", type=float, default=0.08)
-    p.add_argument("--out-limit", type=float, default=4.0)
-    p.add_argument("--invert-x", action="store_true")
+    p.add_argument(
+        "--pid-preset",
+        default="en_iyi_dikey",
+        choices=["none", *sorted(PRESETS.keys())],
+        help="Kayıtlı PID: en_iyi_dikey (varsayılan), iyi_yatay, dikey_ayar1",
+    )
+    # Preset yoksa/override
+    p.add_argument("--kp", type=float, default=None, help="Pan P (en_iyi_dikey=0.034)")
+    p.add_argument("--ki", type=float, default=None)
+    p.add_argument("--kd", type=float, default=None, help="Pan D (en_iyi_dikey=0.010)")
+    p.add_argument("--kp-tilt", type=float, default=None, help="Tilt P (en_iyi_dikey=0.018)")
+    p.add_argument("--ki-tilt", type=float, default=None)
+    p.add_argument("--kd-tilt", type=float, default=None, help="Tilt D (en_iyi_dikey=0.022)")
+    p.add_argument("--out-limit", type=float, default=5.0)
+    p.add_argument(
+        "--tilt-gravity-kg",
+        type=float,
+        default=None,
+        help="Tilt yerçekimi FF (derece). None=preset. 0=kapalı",
+    )
+    p.add_argument(
+        "--tilt-gravity-mode",
+        choices=("cos", "const"),
+        default=None,
+        help="cos: Kg*cos(elev); const: sabit Kg",
+    )
+    # Donanım pan tersi artık PC'de SERVO_INVERT_PAN ile yapılıyor.
+    # Çift terslememek için RPi varsayılanı kapalı.
+    p.add_argument(
+        "--invert-x",
+        dest="invert_x",
+        action="store_true",
+        default=False,
+        help="Yatay (pan) yönünü RPi'de ters çevir (PC invert varsa kullanma)",
+    )
+    p.add_argument(
+        "--no-invert-x",
+        dest="invert_x",
+        action="store_false",
+        help="Yatay invert'i kapat",
+    )
     p.add_argument("--invert-y", action="store_true")
+    p.add_argument(
+        "--video-host",
+        default="",
+        help="PC IP — kamera UDP hedefi (boşsa ilk TCP istemcisine yayın)",
+    )
+    p.add_argument("--video-port", type=int, default=5000, help="PC UDP video portu")
+    p.add_argument("--video-width", type=int, default=640)
+    p.add_argument("--video-height", type=int, default=480)
+    p.add_argument("--video-fps", type=int, default=30)
+    p.add_argument("--no-video", action="store_true", help="Kamera UDP akışını kapat")
     args = p.parse_args()
     if args.lidar_port.strip() == "":
         args.lidar_port = None
+    args.video_host = (args.video_host or "").strip()
+
+    preset = PRESETS.get(args.pid_preset) if args.pid_preset != "none" else None
+    if preset is not None:
+        if args.kp is None:
+            args.kp = preset.kp
+        if args.ki is None:
+            args.ki = preset.ki
+        if args.kd is None:
+            args.kd = preset.kd
+        if args.kp_tilt is None:
+            args.kp_tilt = preset.kp_tilt
+        if args.ki_tilt is None:
+            args.ki_tilt = preset.ki_tilt
+        if args.kd_tilt is None:
+            args.kd_tilt = preset.kd_tilt
+        if args.tilt_gravity_kg is None:
+            args.tilt_gravity_kg = preset.tilt_gravity_kg
+        if args.tilt_gravity_mode is None:
+            args.tilt_gravity_mode = preset.tilt_gravity_mode
+        t_kp, t_ki, t_kd = resolve_tilt_gains(
+            args.kp, args.ki, args.kd, args.kp_tilt, args.ki_tilt, args.kd_tilt
+        )
+        print(
+            f"[OK] PID preset={preset.name} "
+            f"pan P={args.kp:.3f} D={args.kd:.3f} | "
+            f"tilt P={t_kp:.3f} D={t_kd:.3f} | "
+            f"tilt_ff={args.tilt_gravity_kg:.2f}°"
+        )
+    else:
+        if args.kp is None:
+            args.kp = 0.0
+        if args.ki is None:
+            args.ki = 0.0
+        if args.kd is None:
+            args.kd = 0.0
+        if args.tilt_gravity_kg is None:
+            args.tilt_gravity_kg = 0.0
+        if args.tilt_gravity_mode is None:
+            args.tilt_gravity_mode = "cos"
+
     run(args)
 
 
