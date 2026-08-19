@@ -54,10 +54,11 @@ _AXIS_LABEL_ACTIVE = ("color:#c8cdd6;font-size:11px;font-weight:600;"
 _AXIS_LABEL_PASSIVE = ("color:#6b7280;font-size:11px;font-weight:600;"
                        "background:transparent;border:none;")
 
-# PID varsayılanı 0 — kazançları yalnızca operatör ekrandan verir
-_DEFAULT_KP = 0.0
+# PID — preset adı: iyi_yatay (yatay kilit için iyi bulunan)
+_DEFAULT_KP = 0.034
 _DEFAULT_KI = 0.0
-_DEFAULT_KD = 0.0
+_DEFAULT_KD = 0.010
+_PID_PRESET_NAME = "iyi_yatay"
 
 
 class ServoControlWidget(QFrame):
@@ -113,7 +114,14 @@ class ServoControlWidget(QFrame):
         self.x_slider.valueChanged.connect(lambda v:(self.x_value.setText(f"{v}°"),self._emit()))
         self.y_slider.valueChanged.connect(lambda v:(self.y_value.setText(f"{v}°"),self._emit()))
 
-        # PID — 3 sütun yan yana
+        # PID — 3 sütun yan yana (preset: iyi_yatay)
+        pid_hdr = QLabel(f"PID · {_PID_PRESET_NAME}")
+        pid_hdr.setStyleSheet(
+            "color:#9aa4b2;font-size:10px;font-weight:700;"
+            "background:transparent;border:none;"
+        )
+        pid_hdr.setFixedHeight(14)
+        L.addWidget(pid_hdr)
         pid_row = QHBoxLayout(); pid_row.setSpacing(6)
         for lbl_txt, attr, default in [("P","pid_p",_DEFAULT_KP),
                                        ("I","pid_i",_DEFAULT_KI),
